@@ -24,7 +24,7 @@ rustPlatform.buildRustPackage {
   ];
 
   meta = {
-    description = "run-in-cloud is a run-in-roblox replacement";
+    description = "run-in-cloud is a run-in-roblox replacement ment to execute Luau code via a LuauExecutionSessionTask.";
     homepage = "https://github.com/techs-sus/run-in-cloud";
     license = lib.licenses.asl20; # apache license 2.0
     maintainers = [

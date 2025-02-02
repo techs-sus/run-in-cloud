@@ -1,7 +1,10 @@
 mod api;
 mod secrets;
 
+use api::TaskState;
 use clap::{Parser, Subcommand};
+use owo_colors::{OwoColorize, Stream};
+use spinners::{Spinner, Spinners};
 use std::{io::Write, path::PathBuf, time::Duration};
 
 const CHECKMARK_SYMBOL: &str = "\u{2714}";
@@ -14,7 +17,7 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Command {
-	/// Login with an Open Cloud API key.
+	/// Login with an Open Cloud API key and a target experience.
 	Login {
 		/// A key to be used in Open Cloud.
 		#[arg(short, long)]
@@ -58,25 +61,37 @@ async fn main() -> Result<(), anyhow::Error> {
 
 		Command::Run { place, script } => {
 			let secrets = secrets::read_secrets()?;
-			let client = api::get_roblox_request_client(&secrets.key)?;
-			let target_version = {
-				let mut publish_spinner = spinners::Spinner::new(
-					spinners::Spinners::Arrow,
-					"waiting for task to finish executing...".to_owned(),
+			let client = api::create_authenticated_client(&secrets.key)?;
+
+			// we need the place version so that if another task is queued with a different place, our task is not affected
+			// [task 1 -> publish azalea.rbxl @ version 32]
+			// [task 1 -> start @ version 32]
+			// [... other tasks]
+			// [task 4 -> publish tests.rbxl @ version 35]
+			// [task 4 -> start @ version 35]
+			let place_version = {
+				let mut publish_spinner = Spinner::new(
+					Spinners::Arrow,
+					"waiting for place to get published..."
+						.if_supports_color(Stream::Stdout, |text| text.blue())
+						.to_string(),
 				);
 
 				let version =
 					api::publish_place(&client, secrets.universe_id, secrets.place_id, &place).await?;
+
 				publish_spinner.stop_and_persist(
 					CHECKMARK_SYMBOL,
-					"successfully published to place!".to_owned(),
+					"successfully published to place!"
+						.if_supports_color(Stream::Stdout, |text| text.green())
+						.to_string(),
 				);
 				version
 			};
 
-			let path = api::start_luau_execution_task(
+			let path = api::create_luau_execution_task(
 				&client,
-				target_version,
+				place_version,
 				secrets.universe_id,
 				secrets.place_id,
 				std::fs::read_to_string(script)?,
@@ -85,10 +100,11 @@ async fn main() -> Result<(), anyhow::Error> {
 
 			let task_endpoint = format!("https://apis.roblox.com/cloud/v2/{path}");
 
-			// ignore this, it's just a terminal spinner
-			let mut task_spinner = spinners::Spinner::new(
-				spinners::Spinners::Arrow,
-				"waiting for task to finish executing...".to_owned(),
+			let mut task_spinner = Spinner::new(
+				Spinners::Arrow,
+				"waiting for task to finish executing..."
+					.if_supports_color(Stream::Stdout, |text| text.blue())
+					.to_string(),
 			);
 
 			let mut time: u64 = 3;
@@ -100,15 +116,24 @@ async fn main() -> Result<(), anyhow::Error> {
 					Err(..) => {
 						retries -= 1;
 						time *= 2;
-						eprintln!("failed fetching task info, {retries} left");
+						eprintln!(
+							"{}",
+							"failed fetching task info, {retries} left"
+								.if_supports_color(Stream::Stdout, |text| text.red())
+						);
 
 						if retries == 0 {
-							eprintln!("no retries left, exiting");
+							eprintln!(
+								"{}",
+								"no retries left, exiting".if_supports_color(Stream::Stdout, |text| text.red())
+							);
 							std::process::exit(1);
 						}
 					}
 					Ok(task_response) => {
-						if task_response.state == "COMPLETE" || task_response.state == "FAILED" {
+						if task_response.state == TaskState::Complete
+							|| task_response.state == TaskState::Failed
+						{
 							break task_response;
 						}
 					}
@@ -117,42 +142,50 @@ async fn main() -> Result<(), anyhow::Error> {
 				tokio::time::sleep(Duration::from_secs(time)).await;
 			};
 
-			task_spinner.stop_and_persist(CHECKMARK_SYMBOL, "task finished executing!".to_owned());
+			let task_finished_text = match (
+				finished_task_response.create_time,
+				finished_task_response.update_time,
+			) {
+				(Some(create_time), Some(update_time)) => {
+					let duration = humantime::parse_rfc3339(&update_time)?
+						.duration_since(humantime::parse_rfc3339(&create_time)?)?;
 
-			let mut logs: Vec<api::Log> = vec![];
-			let mut next_page_token = String::new();
+					&format!(
+						"task finished executing in {}!",
+						humantime::format_duration(duration)
+					)
+				}
+				_ => "task finished executing!",
+			};
 
-			loop {
-				let response: api::Logs = serde_json::from_str(
-					&client
-						.get(format!(
-							"{task_endpoint}/logs?maxPageSize=10000&pageToken={next_page_token}"
-						))
-						.send()
-						.await?
-						.text()
-						.await?,
-				)?;
+			task_spinner.stop_and_persist(
+				CHECKMARK_SYMBOL,
+				task_finished_text
+					.if_supports_color(Stream::Stdout, |text| text.green())
+					.to_string(),
+			);
 
-				logs.extend(response.logs);
+			let logs = api::get_all_logs(&client, &task_endpoint).await?;
 
-				if response.next_page_token.is_empty() {
-					break;
-				};
-
-				next_page_token = response.next_page_token;
-			}
-
-			let mut lock = std::io::stdout();
+			let mut stdout_lock = std::io::stdout().lock();
 			for message in logs.into_iter().flat_map(|log| log.messages) {
-				lock.write_all(message.as_bytes())?;
-				lock.write_all(b"\n")?;
+				stdout_lock.write_all(message.as_bytes())?;
+				stdout_lock.write_all(b"\n")?;
 			}
-
-			lock.flush()?;
+			stdout_lock.flush()?;
 
 			if let Some(error) = finished_task_response.error {
-				eprintln!("got error with code {}: {}", error.code, error.message);
+				eprintln!(
+					"{} {}{} {}",
+					"task errored with code".if_supports_color(Stream::Stdout, |text| text.red()),
+					error
+						.code
+						.if_supports_color(Stream::Stdout, |text| text.bright_red()),
+					":".if_supports_color(Stream::Stdout, |text| text.red()),
+					error
+						.message
+						.if_supports_color(Stream::Stdout, |text| text.bright_red()),
+				);
 			}
 		}
 	}
