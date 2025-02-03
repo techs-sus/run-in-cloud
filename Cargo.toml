@@ -1,7 +1,14 @@
 [package]
 name = "run-in-cloud"
+description = "run-in-cloud is a run-in-roblox replacement ment to execute Luau code via a LuauExecutionSessionTask."
 version = "0.1.0"
 edition = "2021"
+authors = ["techs-sus"]
+repository = "https://github.com/techs-sus/run-in-cloud"
+license = "Apache-2.0"
+readme = "README.md"
+keywords = ["roblox", "cli"]
+categories = ["command-line-utilities", "roblox"]
 
 [dependencies]
 anyhow = "1"
